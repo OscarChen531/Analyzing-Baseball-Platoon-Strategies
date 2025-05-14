@@ -1,4 +1,4 @@
-# CSAS2025 Data Challenge Submission
+# CSAS2025 Data Challenge 
 
 ## 📊 Project Title
 **Analyzing Baseball Platoon Strategies: Integrating Bat Speed, Swing Length, Spray Angle, Clustering, and Performance Metrics**
