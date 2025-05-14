@@ -1,0 +1,888 @@
+---
+title: "Analyzing Baseball Platoon Strategies: Integrating Bat Speed, Swing Length, Spray Angle, Clustering, and Performance Metrics"
+author: "Wei Chieh Chen"
+affiliation: "Syracuse University"
+date: "2025-04-30"
+output: 
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    latex_engine: pdflatex
+    keep_tex: true
+    extra_dependencies: ["float", "booktabs", "longtable"]
+bibliography: references.bib
+csl: apa.csl
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{amsmath}
+  - \usepackage{graphicx}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+# platoon_code.R
+# Analyzing Baseball Platoon Strategies: Integrating Bat Speed, Swing Length, Spray Angle, Clustering, and Performance Metrics
+# Author: Wei Chieh Chen
+# Date: April 30, 2025
+
+# Load libraries
+library(knitr)
+library(kableExtra)
+library(tidyr)
+library(factoextra)
+library(MASS)
+library(ggplot2)
+library(summarytools)
+library(baseballr)
+library(gridExtra)
+library(dplyr)
+set.seed(123)
+
+# Set theme for visualizations
+theme_set(theme_minimal(base_size = 12) + 
+            theme(
+              plot.title = element_text(hjust = 0.5, face = "bold"),
+              axis.title = element_text(face = "bold"),
+              legend.position = "bottom",
+              panel.grid.minor = element_blank()
+            ))
+
+# Load data with error handling
+data <- tryCatch({
+  read.csv("Final Project/data/statcast_pitch_swing_data_20240402_20241030_with_arm_angle.csv")
+}, error = function(e) {
+  stop("Failed to load CSV. Ensure file is in working directory: ", e)
+})
+
+# Check column names
+required_cols <- c("player_name", "bat_speed", "swing_length", "launch_angle", "launch_speed", 
+                   "pitch_type", "arm_angle", "estimated_ba_using_speedangle", 
+                   "estimated_slg_using_speedangle", "woba_value", "stand", "p_throws", 
+                   "balls", "strikes", "on_1b", "on_2b", "on_3b", "hc_x", "hc_y", "type", 
+                   "description", "zone", "plate_x", "plate_z", "sz_top", "sz_bot", "events",
+                   "game_pk", "at_bat_number", "pitch_number", "game_type")
+missing_cols <- setdiff(required_cols, colnames(data))
+if (length(missing_cols) > 0) {
+  stop("Missing columns in data: ", paste(missing_cols, collapse = ", "))
+}
+
+# Calculate plate discipline metrics
+plate_discipline <- data %>%
+  mutate(
+    sz_top = ifelse(is.na(sz_top), median(sz_top, na.rm = TRUE), sz_top),
+    sz_bot = ifelse(is.na(sz_bot), median(sz_bot, na.rm = TRUE), sz_bot),
+    is_strike_zone = zone %in% 1:9,
+    is_strike_zone_plate = plate_x >= -0.83 & plate_x <= 0.83 & plate_z >= sz_bot & plate_z <= sz_top,
+    is_strike_zone = ifelse(is.na(is_strike_zone), is_strike_zone_plate, is_strike_zone),
+    is_swing = description %in% c("hit_into_play", "foul", "swinging_strike", "foul_tip")
+  ) %>%
+  group_by(player_name) %>%
+  summarise(
+    total_pitches = n(),
+    total_swings = sum(is_swing, na.rm = TRUE),
+    in_zone_pitches = sum(is_strike_zone, na.rm = TRUE),
+    out_zone_pitches = sum(!is_strike_zone, na.rm = TRUE),
+    in_zone_swings = sum(is_swing & is_strike_zone, na.rm = TRUE),
+    out_zone_swings = sum(is_swing & !is_strike_zone, na.rm = TRUE),
+    Z_Swing = ifelse(in_zone_pitches > 0, (in_zone_swings / in_zone_pitches) * 100, NA),
+    O_Swing = ifelse(out_zone_pitches > 0, (out_zone_swings / out_zone_pitches) * 100, NA),
+    Swing = (total_swings / total_pitches) * 100,
+    .groups = "drop"
+  ) %>%
+  filter(total_pitches >= 10) %>%
+  mutate(
+    Z_Swing = ifelse(is.na(Z_Swing) | !is.finite(Z_Swing), 67, Z_Swing),
+    O_Swing = ifelse(is.na(O_Swing) | !is.finite(O_Swing), 30, O_Swing),
+    Swing = ifelse(is.na(Swing) | !is.finite(Swing), 47, Swing)
+  ) %>%
+  select(player_name, Z_Swing, O_Swing, Swing)
+
+# Preprocess data for clustering
+data_clustering <- data %>%
+  mutate(
+    player_name = ifelse(stand == "L", paste0(player_name, "-L"), paste0(player_name, "-R")),
+    spray_angle = ifelse(
+      type == "X" & !is.na(hc_x) & !is.na(hc_y),
+      atan2(hc_y - 200, hc_x - 125) * 180 / pi,
+      NA
+    ),
+    adj_spray_angle = ifelse(stand == "L", -spray_angle, spray_angle),
+    count = paste(balls, strikes, sep = "-")
+  ) %>%
+  filter(type == "X" | description %in% c("hit_into_play", "foul", "swinging_strike", "foul_tip")) %>%
+  dplyr::select(player_name, bat_speed, swing_length, launch_angle, launch_speed, pitch_type, 
+                arm_angle, estimated_ba_using_speedangle, estimated_slg_using_speedangle, 
+                woba_value, stand, p_throws, balls, strikes, on_1b, on_2b, on_3b, 
+                spray_angle, adj_spray_angle, count, events, game_pk, at_bat_number) %>%
+  mutate(
+    arm_angle = ifelse(is.na(arm_angle), median(arm_angle, na.rm = TRUE), arm_angle),
+    base_runners = paste(ifelse(is.na(on_1b), 0, 1), ifelse(is.na(on_2b), 0, 1), ifelse(is.na(on_3b), 0, 1), sep = "")
+  ) %>%
+  filter(!is.na(bat_speed) & !is.na(swing_length))
+
+# Calculate attack angle
+attack_angle_data <- data_clustering %>%
+  filter(!is.na(launch_angle) & !is.na(launch_speed)) %>%
+  group_by(player_name) %>%
+  filter(n() >= 30) %>%
+  summarise(
+    attack_angle = {
+      if (max(launch_angle, na.rm = TRUE) - min(launch_angle, na.rm = TRUE) < 6) {
+        mean(launch_angle[order(launch_speed, decreasing = TRUE)][1:15], na.rm = TRUE)
+      } else {
+        bins <- cut(launch_angle, 
+                    breaks = seq(min(launch_angle, na.rm = TRUE), 
+                                 max(launch_angle, na.rm = TRUE), 
+                                 by = 3), 
+                    include.lowest = TRUE)
+        if (length(unique(bins[!is.na(bins)])) < 5) {
+          mean(launch_angle[order(launch_speed, decreasing = TRUE)][1:15], na.rm = TRUE)
+        } else {
+          top_20 <- . %>% arrange(desc(launch_speed)) %>% slice_head(prop = 0.2)
+          binned_data <- data.frame(launch_angle, launch_speed, bins) %>% 
+            group_by(bins) %>% 
+            top_20() %>%
+            ungroup()
+          if (nrow(binned_data) < 5 || sum(!is.na(binned_data$launch_angle)) < 5) {
+            mean(launch_angle[order(launch_speed, decreasing = TRUE)][1:15], na.rm = TRUE)
+          } else {
+            tryCatch({
+              parabola_model <- lm(launch_speed ~ launch_angle + I(launch_angle^2), 
+                                   data = binned_data)
+              peak_angle <- -coef(parabola_model)[2] / (2 * coef(parabola_model)[3])
+              top_15_angle <- mean(launch_angle[order(launch_speed, decreasing = TRUE)][1:15], 
+                                   na.rm = TRUE)
+              # Ensure attack angle is within a realistic range (e.g., -10 to 30 degrees)
+              attack_angle <- mean(c(peak_angle, top_15_angle), na.rm = TRUE)
+              if (attack_angle < -10 || attack_angle > 30 || is.na(attack_angle)) {
+                mean(launch_angle[order(launch_speed, decreasing = TRUE)][1:15], na.rm = TRUE)
+              } else {
+                attack_angle
+              }
+            }, error = function(e) {
+              mean(launch_angle[order(launch_speed, decreasing = TRUE)][1:15], na.rm = TRUE)
+            })
+          }
+        }
+      }
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(attack_angle = ifelse(is.na(attack_angle) | !is.finite(attack_angle), 
+                               median(attack_angle, na.rm = TRUE), 
+                               attack_angle))
+
+# Join attack angle and plate discipline
+data_clustering <- data_clustering %>%
+  left_join(attack_angle_data, by = "player_name") %>%
+  left_join(plate_discipline, by = "player_name")
+
+# Batter-level summaries
+batter_summary <- data_clustering %>%
+  group_by(player_name, pitch_type, stand, p_throws) %>%
+  summarise(
+    bat_speed = mean(bat_speed, na.rm = TRUE),
+    swing_length = mean(swing_length, na.rm = TRUE),
+    attack_angle = mean(attack_angle, na.rm = TRUE),
+    spray_angle = mean(spray_angle, na.rm = TRUE),
+    Z_Swing = mean(Z_Swing, na.rm = TRUE),
+    O_Swing = mean(O_Swing, na.rm = TRUE),
+    Swing = mean(Swing, na.rm = TRUE),
+    eBA = mean(estimated_ba_using_speedangle, na.rm = TRUE),
+    eSLG = mean(estimated_slg_using_speedangle, na.rm = TRUE),
+    woba = mean(woba_value, na.rm = TRUE),
+    n_pitches = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n_pitches >= 20)
+
+# Pivot to wide format
+batter_wide <- batter_summary %>%
+  group_by(pitch_type, p_throws) %>%
+  filter(n() >= 5) %>%
+  ungroup() %>%
+  pivot_wider(
+    names_from = c(pitch_type, p_throws),
+    values_from = c(bat_speed, swing_length, attack_angle, spray_angle, Z_Swing, O_Swing, Swing, eBA, eSLG, woba),
+    values_fill = NA,
+    names_glue = "{pitch_type}_{p_throws}_{.value}"
+  ) %>%
+  group_by(player_name) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE))) %>%
+  ungroup() %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+# PCA
+pca_vars <- batter_wide %>%
+  select(-player_name) %>%
+  select(where(is.numeric))
+
+# Remove zero-variance columns
+zero_var_cols <- names(pca_vars)[apply(pca_vars, 2, function(x) var(x, na.rm = TRUE) == 0 | all(is.na(x)))]
+if (length(zero_var_cols) > 0) {
+  message("Removing zero-variance columns: ", paste(zero_var_cols, collapse = ", "))
+  pca_vars <- pca_vars %>% select(-all_of(zero_var_cols))
+}
+
+# Scale and run PCA
+pca_vars_scaled <- scale(pca_vars)
+pca_result <- prcomp(pca_vars_scaled, center = TRUE, scale. = TRUE)
+pca_scores <- pca_result$x[, 1:4]
+
+# Clustering
+batter_pca <- data.frame(
+  player_name = batter_wide$player_name,
+  stand = batter_summary$stand[match(batter_wide$player_name, batter_summary$player_name)],
+  pca_scores
+)
+rhb_pca <- batter_pca %>% filter(stand == "R")
+lhb_pca <- batter_pca %>% filter(stand == "L")
+rhb_kmeans <- kmeans(rhb_pca[, grep("PC", names(rhb_pca))], centers = 4, nstart = 25)
+lhb_kmeans <- kmeans(lhb_pca[, grep("PC", names(lhb_pca))], centers = 4, nstart = 25)
+batter_pca$cluster <- NA
+batter_pca$cluster[batter_pca$stand == "R"] <- paste0("RHB-", rhb_kmeans$cluster)
+batter_pca$cluster[batter_pca$stand == "L"] <- paste0("LHB-", lhb_kmeans$cluster)
+
+# Platoon summary (Table 1 - for FF pitch type, and Table A2 - full summary)
+# Full Platoon Summary (Table A2 in Appendix)
+platoon_summary_full <- batter_summary %>%
+  left_join(select(batter_pca, player_name, cluster), by = "player_name", relationship = "many-to-one") %>%
+  group_by(cluster, pitch_type, p_throws) %>%
+  summarise(
+    mean_bat_speed = mean(bat_speed, na.rm = TRUE),
+    mean_swing_length = mean(swing_length, na.rm = TRUE),
+    mean_attack_angle = mean(attack_angle, na.rm = TRUE),
+    n_batters = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n_batters >= 5) %>%
+  mutate(
+    mean_bat_speed = round(mean_bat_speed, 1),
+    mean_swing_length = round(mean_swing_length, 1),
+    mean_attack_angle = round(mean_attack_angle, 1)
+  ) %>%
+  select(cluster, pitch_type, p_throws, mean_bat_speed, mean_swing_length, mean_attack_angle) %>%
+  rename(
+    Cluster = cluster,
+    Pitch_Type = pitch_type,
+    Pitcher = p_throws,
+    "Bat Speed (mph)" = mean_bat_speed,
+    "Swing Length (ft)" = mean_swing_length,
+    "Attack Angle (deg)" = mean_attack_angle
+  )
+
+# Table 1: Platoon Summary for FF pitch type
+platoon_summary_ff <- platoon_summary_full %>%
+  filter(Pitch_Type == "FF") %>%
+  select(Cluster, Pitcher, "Bat Speed (mph)", "Swing Length (ft)", "Attack Angle (deg)")
+
+# Monte Carlo simulation
+events <- c("DoublePlay", "Error", "GroundOut", "HBP_CatInt", "HR", "K", "LineOut_InfFly", 
+            "Triple", "Walk", "LongSingle", "MediumSingle", "ShortSingle", "ShortDouble", 
+            "LongDouble", "LongFly", "MediumFly", "ShortFly")
+
+event_probs <- batter_summary %>%
+  left_join(select(batter_pca, player_name, cluster), by = "player_name", relationship = "many-to-one") %>%
+  group_by(cluster) %>%
+  summarise(
+    mean_eBA = mean(eBA, na.rm = TRUE),
+    mean_eSLG = mean(eSLG, na.rm = TRUE),
+    mean_woba = mean(woba, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    HR = mean_woba * 0.2,
+    Walk = mean_woba * 0.15,
+    K = (1 - mean_eBA) * 0.3,
+    GroundOut = (1 - mean_eBA) * 0.2,
+    DoublePlay = (1 - mean_eBA) * 0.05,
+    LineOut_InfFly = (1 - mean_eBA) * 0.1,
+    LongFly = (1 - mean_eBA) * 0.05,
+    MediumFly = (1 - mean_eBA) * 0.05,
+    ShortFly = (1 - mean_eBA) * 0.05,
+    Error = 0.01,
+    HBP_CatInt = 0.015,
+    Triple = mean_eSLG * 0.02,
+    LongDouble = mean_eSLG * 0.03,
+    ShortDouble = mean_eSLG * 0.03,
+    LongSingle = mean_eBA * 0.15,
+    MediumSingle = mean_eBA * 0.15,
+    ShortSingle = mean_eBA * 0.15,
+    total_prob = rowSums(across(HR:ShortSingle), na.rm = TRUE),
+    across(HR:ShortSingle, ~ .x / total_prob)
+  ) %>%
+  select(cluster, all_of(events))
+
+simulate_game <- function(lineup_clusters, event_probs, park_factor = 1) {
+  runs <- 0
+  for (inning in 1:9) {
+    outs <- 0
+    runners <- c(0, 0, 0)
+    while (outs < 3) {
+      batter_cluster <- lineup_clusters[(inning + outs) %% length(lineup_clusters) + 1]
+      event <- sample(events, 1, prob = event_probs[event_probs$cluster == batter_cluster, events])
+      runs <- runs + ifelse(event == "HR", 1 + sum(runners), 0)
+      outs <- outs + ifelse(event %in% c("K", "GroundOut"), 1, 0)
+    }
+  }
+  runs * park_factor
+}
+
+lineup_clusters <- c("RHB-1", "LHB-2", "RHB-4", "LHB-1", "RHB-3", "LHB-3", "RHB-2", "LHB-4", "RHB-1")
+runs_sim <- replicate(10000, simulate_game(lineup_clusters, event_probs, park_factor = 1))
+mean_runs <- mean(runs_sim)
+
+# Platoon performance analysis (Tables 2 and 3)
+data <- data %>%
+  filter(game_type %in% c("R", "F", "D", "L", "W"))
+
+batter_handedness <- data %>%
+  group_by(batter) %>%
+  summarise(
+    stands_R = any(stand == "R", na.rm = TRUE),
+    stands_L = any(stand == "L", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    batter_type = case_when(
+      stands_R & stands_L ~ "Switch Hitter",
+      stands_R ~ "RHB",
+      stands_L ~ "LHB",
+      TRUE ~ "Unknown"
+    )
+  )
+
+data <- data %>%
+  left_join(select(batter_handedness, batter, batter_type), by = "batter") %>%
+  filter(batter_type != "Unknown")
+
+data_pa <- data %>%
+  group_by(game_pk, at_bat_number, batter) %>%
+  slice(which.max(pitch_number)) %>%
+  ungroup()
+
+# Add handedness suffix to player_name in data_pa to match attack_angle_data
+data_pa <- data_pa %>%
+  mutate(
+    player_name = ifelse(stand == "L", paste0(player_name, "-L"), paste0(player_name, "-R")),
+    is_hit = events %in% c("single", "double", "triple", "home_run"),
+    on_base = events %in% c("single", "double", "triple", "home_run", "walk", "hit_by_pitch"),
+    is_at_bat = !events %in% c("walk", "hit_by_pitch", "sac_fly", "sac_bunt", NA),
+    total_bases = case_when(
+      events == "single" ~ 1,
+      events == "double" ~ 2,
+      events == "triple" ~ 3,
+      events == "home_run" ~ 4,
+      TRUE ~ 0
+    ),
+    is_pa_obp = !events %in% c("sac_bunt", NA)
+  )
+
+# Join attack angle to data_pa
+data_pa <- data_pa %>%
+  left_join(select(attack_angle_data, player_name, attack_angle), 
+            by = "player_name")
+
+# Verify columns exist
+if (!all(c("bat_speed", "swing_length", "attack_angle") %in% colnames(data_pa))) {
+  stop("Required columns (bat_speed, swing_length, attack_angle) not found in data_pa")
+}
+
+# Ensure no NA values in critical columns for aggregation
+data_pa <- data_pa %>%
+  mutate(
+    bat_speed = ifelse(is.na(bat_speed), mean(bat_speed, na.rm = TRUE), bat_speed),
+    swing_length = ifelse(is.na(swing_length), mean(swing_length, na.rm = TRUE), swing_length),
+    attack_angle = ifelse(is.na(attack_angle) | !is.finite(attack_angle), 
+                          mean(attack_angle_data$attack_angle, na.rm = TRUE), attack_angle)
+  )
+
+# Compute league-wide averages (lgOBP and lgSLG) from data_pa
+league_averages <- data_pa %>%
+  summarise(
+    total_hits = sum(is_hit, na.rm = TRUE),
+    total_at_bats = sum(is_at_bat, na.rm = TRUE),
+    total_on_base = sum(on_base, na.rm = TRUE),
+    total_pa_obp = sum(is_pa_obp, na.rm = TRUE),
+    total_bases = sum(total_bases, na.rm = TRUE),
+    mean_obp = total_on_base / total_pa_obp,
+    mean_slg = total_bases / total_at_bats,
+    .groups = "drop"
+  )
+
+# Define lgOBP and lgSLG
+lgOBP <- league_averages$mean_obp  # League-wide OBP
+lgSLG <- league_averages$mean_slg  # League-wide SLG
+
+# Compute performance summary
+performance_summary <- data_pa %>%
+  group_by(batter_type, p_throws) %>%
+  summarise(
+    mean_bat_speed = mean(bat_speed, na.rm = TRUE),
+    mean_swing_length = mean(swing_length, na.rm = TRUE),
+    mean_attack_angle = mean(attack_angle, na.rm = TRUE),
+    total_hits = sum(is_hit, na.rm = TRUE),
+    total_at_bats = sum(is_at_bat, na.rm = TRUE),
+    mean_ba = total_hits / total_at_bats,
+    total_on_base = sum(on_base, na.rm = TRUE),
+    total_pa_obp = sum(is_pa_obp, na.rm = TRUE),
+    mean_obp = total_on_base / total_pa_obp,
+    total_bases = sum(total_bases, na.rm = TRUE),
+    mean_slg = total_bases / total_at_bats,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mean_ops = mean_obp + mean_slg,
+    ops_plus = 100 * (mean_obp / lgOBP + mean_slg / lgSLG - 1),
+    mean_bat_speed = round(mean_bat_speed, 1),
+    mean_swing_length = round(mean_swing_length, 1),
+    mean_attack_angle = round(mean_attack_angle, 1),
+    mean_ba = round(mean_ba, 3),
+    mean_obp = round(mean_obp, 3),
+    mean_slg = round(mean_slg, 3),
+    mean_ops = round(mean_ops, 3),
+    ops_plus = round(ops_plus, 0)
+  )
+
+table_vs_LHP <- performance_summary %>%
+  filter(p_throws == "L") %>%
+  select(batter_type, mean_bat_speed, mean_swing_length, mean_attack_angle, mean_ba, mean_obp, mean_slg, mean_ops, ops_plus) %>%
+  rename(
+    Batter_Type = batter_type,
+    "Bat Speed (mph)" = mean_bat_speed,
+    "Swing Length (ft)" = mean_swing_length,
+    "Attack Angle (deg)" = mean_attack_angle,
+    Batting_Avg = mean_ba,
+    On_Base_Pct = mean_obp,
+    Slugging_Pct = mean_slg,
+    OPS = mean_ops
+  )
+
+table_vs_RHP <- performance_summary %>%
+  filter(p_throws == "R") %>%
+  select(batter_type, mean_bat_speed, mean_swing_length, mean_attack_angle, mean_ba, mean_obp, mean_slg, mean_ops, ops_plus) %>%
+  rename(
+    Batter_Type = batter_type,
+    "Bat Speed (mph)" = mean_bat_speed,
+    "Swing Length (ft)" = mean_swing_length,
+    "Attack Angle (deg)" = mean_attack_angle,
+    Batting_Avg = mean_ba,
+    On_Base_Pct = mean_obp,
+    Slugging_Pct = mean_slg,
+    OPS = mean_ops
+  )
+
+# Generate Table A1: Descriptive statistics using summarytools
+selected_data <- data[, c("bat_speed", "swing_length", "launch_angle", "launch_speed", "stand", "p_throws", "pitch_type")]
+table_a1 <- dfSummary(selected_data, style = "grid", plain.ascii = FALSE, graph.magnif = 0.75, valid.col = TRUE, tmp.img.dir = "/tmp")
+
+# Visualizations (3 figures for main body, 3 for appendix)
+# Figure 1: Bat Speed vs. Launch Speed for Home Runs (main body)
+hr_data <- data %>%
+  filter(events == "home_run" & !is.na(bat_speed) & !is.na(launch_speed)) 
+
+lm_model <- lm(launch_speed ~ bat_speed, data = hr_data)
+intercept <- coef(lm_model)[1]
+slope <- coef(lm_model)[2]
+ref_bat_speed <- 75
+adj_intercept <- intercept + slope * ref_bat_speed
+equation <- sprintf("LS = %.1f + %.2f × (BS – %.0f)", adj_intercept, slope, ref_bat_speed)
+
+swing_launch_plot <- ggplot(hr_data, aes(x = bat_speed, y = launch_speed)) +
+  geom_point(alpha = 0.5, size = 1, color = "black") +
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  annotate("text", 
+           x = min(hr_data$bat_speed, na.rm = TRUE) + 5, 
+           y = max(hr_data$launch_speed, na.rm = TRUE) - 5, 
+           label = equation, 
+           color = "red", 
+           hjust = 0, 
+           size = 4) +
+  labs(
+    title = "Relationship of Swing Speed and Launch Speed\n2024 Home Runs",
+    x = "Swing Speed (mph)",
+    y = "Launch Speed (mph)",
+    caption = "Note: Data includes all home runs with non-missing bat speed and launch speed."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold"),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  )
+
+# Figure 2: PCA Scree Plot (main body)
+scree_plot <- fviz_eig(pca_result, addlabels = TRUE, ylim = c(0, 50)) +
+  labs(
+    title = "PCA Scree Plot",
+    caption = "Note: Shows variance explained by each principal component."
+  ) +
+  theme_minimal(base_size = 12)
+
+# Figure 3: Batter Clusters in PCA Space (main body)
+cluster_plot <- fviz_cluster(
+  list(data = pca_scores, cluster = batter_pca$cluster),
+  geom = "point",
+  ellipse.type = "convex",
+  palette = "jco",
+  pointsize = 1.5,
+  alpha = 0.5
+) +
+  labs(
+    title = "Batter Clusters in PCA Space",
+    caption = "Note: Clusters based on PCA scores (PC1 and PC2)."
+  ) +
+  theme_minimal(base_size = 12)
+
+# Figure A1: Bat Speed vs. Swing Length (appendix)
+swing_length_plot <- ggplot(data, aes(x = bat_speed, y = swing_length)) +
+  geom_point(alpha = 0.3, size = 1.5, color = "forestgreen") +
+  geom_smooth(method = "lm", color = "red", se = TRUE) +
+  labs(
+    title = "Bat Speed vs. Swing Length",
+    x = "Bat Speed (mph)",
+    y = "Swing Length (ft)",
+    caption = "Note: Includes swing-related pitches with non-missing bat_speed and swing_length."
+  ) +
+  theme(legend.position = "none")
+
+# Figure A2: Swing Length by Pitch Count (appendix)
+swing_length_means <- data %>%
+  mutate(count = paste(balls, strikes, sep = "-")) %>%
+  filter(count %in% c("0-0", "0-1", "0-2", "1-0", "1-1", "1-2", "2-0", "2-1", "2-2", "3-0", "3-1", "3-2")) %>%
+  group_by(count) %>%
+  summarise(mean_swing_length = mean(swing_length, na.rm = TRUE), .groups = "drop")
+
+swing_length_count_plot <- ggplot(swing_length_means, aes(x = count, y = mean_swing_length)) +
+  geom_point(size = 3, color = "black") +
+  labs(
+    title = "Swing Length by Count",
+    x = "Count",
+    y = "Mean Swing Length"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+# Figure A3: Pitch Type by Pitcher Handedness (appendix)
+pitch_hand_plot <- ggplot(data, aes(x = pitch_type, fill = p_throws)) +
+  geom_bar(position = "dodge", color = "black") +
+  scale_fill_brewer(palette = "Set2", name = "Pitcher Handedness") +
+  labs(
+    title = "Pitch Type by Pitcher Handedness",
+    x = "Pitch Type",
+    y = "Count",
+    caption = "Note: Includes all swing-related pitches."
+  ) +
+  theme(legend.position = "bottom")
+
+# Save plots
+ggsave("swing_launch_plot.png", swing_launch_plot, width = 6, height = 4, dpi = 300)
+ggsave("scree_plot.png", scree_plot, width = 6, height = 4, dpi = 300)
+ggsave("cluster_plot.png", cluster_plot, width = 6, height = 4, dpi = 300)
+ggsave("swing_length_plot.png", swing_length_plot, width = 6, height = 4, dpi = 300)
+ggsave("swing_length_count_plot.png", swing_length_count_plot, width = 8, height = 5, dpi = 300)
+ggsave("pitch_hand_plot.png", pitch_hand_plot, width = 8, height = 5, dpi = 300)
+
+# Print tables for paper
+cat("\nTable 1: Platoon Summary by Cluster for Four-Seam Fastballs (FF)\n")
+print(platoon_summary_ff)
+cat("\nTable 2: Batter Performance vs LHP\n")
+print(table_vs_LHP)
+cat("\nTable 3: Batter Performance vs RHP\n")
+print(table_vs_RHP)
+cat("\nTable A1: Descriptive Statistics of Key Variables\n")
+print(table_a1, method = "render")
+cat("\nTable A2: Full Platoon Summary by Cluster, Pitch Type, and Pitcher Handedness\n")
+print(platoon_summary_full)
+cat("\nMonte Carlo Simulation: Average Runs per Game\n")
+print(mean_runs)
+```
+
+\clearpage
+
+# Abstract
+
+This study analyzes platoon strategies in baseball using 2024 Statcast data, focusing on bat speed, swing length, attack angle, and batter performance metrics. We apply multivariate clustering to group batters by handedness and swing characteristics, followed by a Monte Carlo simulation to estimate runs scored. Additionally, we calculate performance metrics (batting average, on-base percentage, slugging percentage, OPS, and OPS+) for right-handed, left-handed, and switch hitters against left- and right-handed pitchers, alongside swing metrics. Results show distinct platoon advantages, with left-handed batters excelling against right-handed pitchers (OPS+ = 108) and right-handed batters performing better against left-handed pitchers (OPS+ = 104). These findings provide actionable insights for optimizing lineup decisions in professional baseball.
+
+# Introduction
+
+In baseball, platoon strategies leverage batter-pitcher handedness matchups to enhance offensive output. Right-handed batters (RHB) typically perform better against left-handed pitchers (LHP), while left-handed batters (LHB) excel against right-handed pitchers (RHP) [@winston2022mathletics]. Switch hitters offer flexibility by batting from either side. Statcast data, with metrics like bat speed, swing length, and attack angle, enables deeper analysis of these dynamics [@albert2024bat; @petriello2024statcast]. This study uses 2024 Statcast data to cluster batters, simulate game outcomes, and measure platoon performance through batting average (BA), on-base percentage (OBP), slugging percentage (SLG), OPS, and OPS+, alongside swing characteristics. We aim to provide insights for optimizing lineup strategies.
+
+# Data and Methods
+
+## Data Source
+
+We use the statcast_pitch_swing_data_20240402_20241030_with_arm_angle.csv dataset from the CSAS 2025 Data Challenge, which includes pitch-level data for the 2024 MLB regular season and playoffs. The dataset contains 701,557 pitches, with key variables such as bat speed (mean = 71.1 mph, SD = 4.8), swing length (mean = 7.0 ft, SD = 0.6), launch angle (mean = 12.8 degrees, SD = 24.2), launch speed (mean = 87.5 mph, SD = 14.6), and batter/pitcher handedness (stand, p_throws). These swing metrics were introduced by Statcast in 2024 to capture batter mechanics [@petriello2024statcast]. Additional variables include pitch type (e.g., FF for four-seam fastballs), event outcomes (events), and contextual variables like balls, strikes, and runners on base. For league-wide context, we reference the 2024 Major League Batting Year-by-Year Averages [@baseballreference2024], which report a league BA of 0.243, OBP of 0.312, and SLG of 0.399. A detailed data summary, including descriptive statistics for key variables, is provided in Table A1 in the appendix.
+
+## Preprocessing
+
+We preprocess the data by:
+
+- Filtering for swing-related pitches (type == "X" or specific descriptions like "hit_into_play").
+- Calculating spray angle using hit coordinates:  \(sprayangle = atan2(hc_y - 200, hc_x - 125) \times 180 / \pi\) , adjusted for batter handedness.
+- Computing attack angle as the average launch angle of the top 20% of swings by launch speed, fitted with a parabolic model [@marshall2017reverse].
+- Calculating plate discipline metrics (Z-Swing%, O-Swing%, Swing%) based on swing decisions in and out of the strike zone.
+
+## Clustering Analysis
+
+We aggregate batter-level summaries by player, pitch type, and pitcher handedness, calculating mean bat speed, swing length, attack angle, spray angle, and estimated BA (eBA) and SLG (eSLG). To reduce dimensionality, we apply Principal Component Analysis (PCA), retaining the first four principal components, which capture the majority of variance in the data [@abdi2010principal]. We then perform k-means clustering (k=4) separately for right-handed batters (RHB) and left-handed batters (LHB), resulting in eight distinct clusters.
+
+Labeling of Clusters: The clusters for right-handed batters are labeled RHB-1, RHB-2, RHB-3, and RHB-4, where the prefix "RHB" indicates right-handed batters, and the numbers 1 to 4 represent the four distinct groups identified by the k-means algorithm. Similarly, the clusters for left-handed batters are labeled LHB-1, LHB-2, LHB-3, and LHB-4, with "LHB" denoting left-handed batters.
+
+Cluster Characteristics: Each cluster represents a unique batter profile based on swing metrics, as observed in Table 1 (four-seam fastball data):
+- RHB-1: Contact-oriented hitters with moderate bat speed (70.9–71.2 mph) and shorter swings (6.9–7.0 ft). They have a low attack angle (6.2–6.5 degrees), indicating a flatter swing suited for line drives and ground balls.
+- RHB-2: Aggressive power hitters with high bat speed (72.4–72.8 mph) and longer swings (7.3 ft). Their higher attack angle (15.9 degrees) suggests an upward swing path optimized for fly balls and home runs.
+- RHB-3: Compact swingers with lower bat speed (67.0 mph) and the shortest swings (6.4 ft). Their attack angle (7.6 degrees) indicates a focus on contact hitting with minimal loft.
+- RHB-4: Balanced hitters with moderate bat speed (69.4–69.5 mph) and swing length (6.8 ft). They have a moderate attack angle (14.8–15.3 degrees), suitable for a mix of power and contact hitting.
+- LHB-1: Compact swingers with lower bat speed (65.2–66.0 mph) and shorter swings (6.3 ft). Their attack angle (10.2–10.7 degrees) suggests a balanced approach with moderate loft.
+- LHB-2: Versatile hitters with moderate bat speed (69.1–69.9 mph) and swing length (6.7 ft). Their attack angle varies (10.5–12.2 degrees), showing adaptability to different pitching matchups.
+- LHB-3: Power hitters with higher bat speed (70.2–70.6 mph) and moderate swing length (6.8–6.9 ft). They have the highest attack angle (18.6–20.1 degrees), ideal for generating lift and power, especially against RHP.
+- LHB-4: Aggressive hitters with the highest bat speed (72.3–73.4 mph) and moderate swing length (6.8–6.9 ft). Their attack angle (13.7–13.8 degrees) supports a power-hitting profile with consistent loft.
+
+These clusters help identify distinct batter profiles, which can inform scouting, player development, and lineup strategies by highlighting strengths in specific platoon matchups.
+
+## Monte Carlo Simulation
+
+We estimate event probabilities (e.g., home run, strikeout, walk, single) for each cluster based on their mean estimated BA (eBA), estimated SLG (eSLG), and wOBA, derived from the Statcast data. These probabilities are calculated using a simplified model where, for example, the probability of a home run is proportional to wOBA, while strikeouts and groundouts are based on (1 - eBA), adjusted for realistic event distributions (e.g., HR probability = 0.2 × wOBA, strikeout probability = 0.3 × (1 - eBA)). A Monte Carlo simulation is then conducted to estimate offensive output, running 10,000 simulated games with a sample lineup.
+
+- Simulation Setup: The sample lineup consists of nine batters alternating between RHB and LHB clusters: RHB-1, LHB-2, RHB-4, LHB-1, RHB-3, LHB-3, RHB-2, LHB-4, RHB-1. This lineup reflects a balanced platoon strategy, mixing different batter profiles to optimize performance against a generic opponent (assumed to be a mix of RHP and LHP). Each game simulates nine innings, with outcomes (e.g., runs scored, outs) determined by sampling from the event probabilities for each batter in the lineup. A park factor of 1 is applied, assuming a neutral stadium environment [@winston2022mathletics].
+- Results and Implications: The simulation estimates an average of 4.8664 runs per game, which aligns with typical MLB team scoring rates (e.g., the 2024 MLB average was approximately 4.5 runs per game per team, per Baseball Reference, 2024). This result suggests that the alternating platoon lineup leverages handedness advantages effectively, as clusters like LHB-3 (power hitters) and RHB-2 (aggressive swingers) contribute to higher run production against opposite-handed pitchers. The simulation provides a baseline for expected offensive output, which can be used to evaluate lineup configurations and inform in-game decisions, such as substituting batters to exploit specific platoon matchups.
+
+## Platoon Performance Metrics
+
+We aggregate the data to the plate appearance level by selecting the last pitch of each PA (using game_pk, at_bat_number, batter). We classify batters as RHB, LHB, or Switch Hitters based on their stand values across PAs. Performance metrics are calculated as follows:
+
+- BA: Hits / At-Bats (excluding walks, HBP, sac flies, sac bunts).
+- OBP: (Hits + Walks + HBP) / (At-Bats + Walks + HBP + Sac Flies).
+- SLG: Total Bases / At-Bats (total bases = 1 for single, 2 for double, 3 for triple, 4 for home run).
+- OPS: OBP + SLG.
+- OPS+: \(100 \times \left( \frac{\text{OBP}}{\text{lgOBP}} + \frac{\text{SLG}}{\text{lgSLG}} - 1 \right)\), where lgOBP = 0.309 and lgSLG = 0.397 (calculated from the dataset).
+
+# Results
+## Clustering and Simulation Results
+
+The PCA scree plot (Figure 2) shows that the first four principal components explain a significant portion of variance in batter swing metrics [@abdi2010principal]. Clustering results (Figure 3) reveal distinct groups of RHB and LHB, as described in Section 2.3. For right-handed batters, RHB-2 represents aggressive power hitters with high bat speed, while RHB-3 includes contact-oriented hitters with shorter swings. For left-handed batters, LHB-3 features power hitters with high attack angles, and LHB-1 consists of batters with compact swings.
+
+Table 1 summarizes the swing characteristics of all 8 clusters against four-seam fastballs (FF), focusing on bat speed, swing length, and attack angle. For example, RHB-2 against RHP fastballs has a bat speed of 72.4 mph, while LHB-3 against RHP fastballs shows a higher attack angle of 20.1 degrees, suggesting a more upward swing suited for power hitting. LHB clusters generally exhibit higher attack angles against RHP (e.g., LHB-3: 20.1 degrees) compared to LHP (e.g., LHB-3: 18.6 degrees), which may contribute to their platoon advantage against RHP. The full platoon summary across all pitch types is provided in Table A2 in the appendix.
+
+The Monte Carlo simulation, detailed in Section 2.4, estimates an average of 4.8664 runs per game, reflecting realistic offensive output adjusted for platoon matchups [@winston2022mathletics].
+
+## Platoon Performance Analysis
+
+Tables 2 and 3 (for LHP) and Tables 4 and 5 (for RHP) present the swing characteristics and performance metrics of RHB, LHB, and Switch Hitters, respectively. Key findings include:
+
+- vs LHP (Tables 2 and 3): RHB outperform LHB, with an OPS+ of 104 compared to 89 for LHB. Switch Hitters perform slightly above average (OPS+ = 105). RHB also have a higher bat speed (70.6 mph) compared to LHB (69.1 mph), though Switch Hitters show a lower attack angle (9.6 degrees), indicating a flatter swing profile.
+- vs RHP (Tables 4 and 5): LHB excel with an OPS+ of 108, while RHB have an OPS+ of 95. Switch Hitters are near average (OPS+ = 100). LHB show a higher attack angle (12.7 degrees) compared to RHB (11.5 degrees), which may contribute to their higher slugging percentage (0.416).
+
+## Visualization of Swing Dynamics
+
+Figure 1 illustrates the relationship between bat speed and launch speed for home runs, showing a positive correlation (Launch Speed = 104.4 + 0.54 × (Bat Speed – 75)) [@albert2024bat]. This linear model assumes a linear relationship between bat speed and launch speed, suggesting that higher bat speeds contribute to harder-hit balls, increasing home run likelihood.
+
+```{r}
+table1 <- data.frame(
+  Cluster = c("LHB-1", "LHB-1", "LHB-2", "LHB-2", "LHB-3", "LHB-3", "LHB-4", "LHB-4",
+              "RHB-1", "RHB-1", "RHB-2", "RHB-2", "RHB-3", "RHB-3", "RHB-4", "RHB-4"),
+  Pitcher = c("LHP", "RHP", "LHP", "RHP", "LHP", "RHP", "LHP", "RHP",
+              "LHP", "RHP", "LHP", "RHP", "LHP", "RHP", "LHP", "RHP"),
+  "Bat Speed (mph)" = c(65.2, 66.0, 69.9, 69.1, 70.2, 70.6, 72.3, 73.4,
+                        71.2, 70.9, 72.8, 72.4, 67.0, 67.0, 69.5, 69.4),
+  "Swing Length (ft)" = c(6.3, 6.3, 6.7, 6.7, 6.8, 6.9, 6.8, 6.9,
+                          6.9, 7.0, 7.3, 7.3, 6.4, 6.4, 6.8, 6.8),
+  "Attack Angle (deg)" = c(10.7, 10.2, 10.5, 12.2, 18.6, 20.1, 13.7, 13.8,
+                           6.2, 6.5, 15.9, 15.9, 7.6, 7.6, 14.8, 15.3)
+)
+
+kable(table1, format = "latex", booktabs = TRUE, align = "c", caption = "Platoon Summary by Cluster for Four-Seam Fastballs (FF)") %>%
+  kable_styling(latex_options = c("HOLD_position"))
+```
+
+```{r}
+table2a <- data.frame(
+  Batter_Type = c("LHB", "RHB", "Switch Hitter"),
+  "Bat Speed (mph)" = c(69.1, 70.6, 69.3),
+  "Swing Length (ft)" = c(7.1, 7.3, 7.2),
+  "Attack Angle (deg)" = c(12.8, 11.4, 9.6)
+)
+
+kable(table2a, format = "latex", booktabs = TRUE, align = "c", caption = "Swing Metrics vs LHP") %>%
+  kable_styling(latex_options = c("HOLD_position"))
+```
+
+```{r}
+table2b <- data.frame(
+  Batter_Type = c("LHB", "RHB", "Switch Hitter"),
+  Batting_Avg = c(0.236, 0.246, 0.252),
+  On_Base_Pct = c(0.301, 0.313, 0.312),
+  Slugging_Pct = c(0.365, 0.406, 0.412),
+  OPS = c(0.666, 0.719, 0.724),
+  OPS_plus = c(89, 104, 105)
+)
+
+kable(table2b, format = "latex", booktabs = TRUE, align = "c", caption = "Performance Metrics vs LHP") %>%
+  kable_styling(latex_options = c("HOLD_position"))
+```
+
+```{r}
+table3a <- data.frame(
+  Batter_Type = c("LHB", "RHB", "Switch Hitter"),
+  "Bat Speed (mph)" = c(70.3, 70.1, 69.0),
+  "Swing Length (ft)" = c(7.2, 7.3, 7.1),
+  "Attack Angle (deg)" = c(12.7, 11.5, 13.6)
+)
+
+kable(table3a, format = "latex", booktabs = TRUE, align = "c", caption = "Swing Metrics vs RHP") %>%
+  kable_styling(latex_options = c("HOLD_position"))
+```
+
+```{r}
+table3b <- data.frame(
+  Batter_Type = c("LHB", "RHB", "Switch Hitter"),
+  Batting_Avg = c(0.244, 0.239, 0.239),
+  On_Base_Pct = c(0.318, 0.301, 0.311),
+  Slugging_Pct = c(0.416, 0.386, 0.393),
+  OPS = c(0.734, 0.687, 0.704),
+  OPS_plus = c(108, 95, 100)
+)
+
+kable(table3b, format = "latex", booktabs = TRUE, align = "c", caption = "Performance Metrics vs RHP") %>%
+  kable_styling(latex_options = c("HOLD_position"))
+```
+
+
+```{r png-row, echo=FALSE, out.width='0.4\\linewidth', fig.align='center', fig.subcap = c("Relationship of Swing Speed and Launch Speed (2024 Home Runs)", "PCA Scree Plot", "Batter Clusters in PCA Space")}
+knitr::include_graphics(
+  c("swing_launch_plot.png", "scree_plot.png", "cluster_plot.png")
+)
+```
+
+# Discussion
+## Value of the Research
+
+This study provides a comprehensive framework for understanding platoon dynamics in baseball, combining advanced swing metrics (bat speed, swing length, attack angle) with multivariate clustering and traditional performance metrics (BA, OBP, SLG, OPS, OPS+). The clustering analysis identifies distinct batter profiles, such as RHB-2 (high bat speed, aggressive swingers) and LHB-3 (power hitters with high attack angles), which can inform player development and scouting strategies. The platoon performance tables (Tables 2 and 3) quantify handedness advantages, confirming that LHB excel against RHP (OPS+ = 108) and RHB perform better against LHP (OPS+ = 104). These insights are valuable for optimizing lineup construction, ensuring managers can maximize offensive output by exploiting favorable matchups.
+
+## Application to a Baseball Franchise
+
+For a baseball franchise, this research offers practical applications in several areas:
+
+- Lineup Optimization: Managers can use the platoon performance metrics to construct daily lineups that maximize offensive production. For example, against an RHP, a team might prioritize LHB with high OPS+ (e.g., 108) to exploit the platoon advantage, while ensuring Switch Hitters (OPS+ = 100) provide balance. The swing metrics in Tables 2 and 3 (e.g., LHB’s attack angle of 12.7 degrees vs RHP) can further guide matchup decisions, favoring batters with optimal swing profiles for power hitting.
+- Player Scouting and Development: The clustering results (e.g., RHB-2 vs RHB-3) highlight different batter profiles based on bat speed, swing length, and attack angle, enabling scouts to target players who fit specific team needs (e.g., power hitters for LHP matchups). Coaches can also use these metrics to tailor training programs, improving players’ swing mechanics [@petriello2024statcast].
+- Game Strategy: The Monte Carlo simulation (4.8664 runs/game) provides a baseline for expected offensive output, which can inform in-game decisions like pinch-hitting or lineup adjustments. Franchises can extend this simulation by incorporating real-time pitcher data to refine strategies further.
+
+By integrating these findings, a franchise can enhance its competitive edge, improving both short-term game outcomes and long-term player development.
+
+## Link to Sports Medicine: Injuries and Load Management
+
+Platoon strategies can also be linked to sports medicine, particularly in the areas of player injuries and load management. By strategically rotating players based on handedness matchups, teams can manage player workload, especially during demanding schedules such as consecutive road games over multiple days. For example:
+
+  - Injury Prevention: Clusters like RHB-2 and LHB-4, characterized by high bat speed and aggressive swings, may exert greater physical stress on players due to the intensity of their swings. Overuse, particularly during long road trips, could increase the risk of injuries such as muscle strains or fatigue-related issues. Platoon strategies that alternate these aggressive hitters with contact-oriented players (e.g., RHB-1, LHB-1) could reduce physical strain, lowering injury risk.
+  - Load Management: Consecutive road games place significant physical and mental demands on players, including travel fatigue and limited recovery time. Platoon strategies can help distribute playing time more evenly across the roster, ensuring key players are rested during grueling schedules. For instance, a team might rest LHB-3 (power hitters) against a tough LHP matchup, preserving their energy for a more favorable RHP matchup later in the road trip, thus optimizing performance while managing fatigue.
+
+This connection highlights the potential of platoon strategies to contribute to player health and longevity, an area of growing interest in sports medicine and team management.
+
+## Limitations
+
+Despite its strengths, this study has several limitations. First, the Monte Carlo simulation simplifies game dynamics by assuming fixed event probabilities and a static park factor of 1, ignoring variables like pitcher fatigue, defensive alignments, and situational context [@winston2022mathletics]. Second, the Statcast data may have missing values for bat speed and swing length, potentially biasing the clustering results. Third, the inclusion of playoff games slightly lowers overall offensive metrics (e.g., league BA = 0.242 vs. 0.243 for regular season, as reported by Baseball Reference, 2024), reflecting stronger pitching in the postseason, which may not generalize to regular-season strategies. Fourth, the linear regression model in Figure 1 assumes independence of observations, but home run data may exhibit dependencies (e.g., multiple home runs by the same batter or in the same game), which could affect the model’s validity. Finally, the analysis focuses on batter performance and does not account for pitcher-specific metrics, such as arm angle variations, which could further refine platoon matchups [@adler2024rainbow].
+
+## Future Work
+
+Addressing the limitations of this study opens several avenues for future research:
+
+  - Incorporate Pitcher Metrics: Including pitcher-specific metrics, such as arm angle variations, could enhance the accuracy of platoon matchups and simulation outcomes [@adler2024rainbow].
+  - Model Situational Factors: Future simulations could account for dynamic factors like pitcher fatigue, defensive alignments, and game situations (e.g., runners on base, inning) to better reflect real-world scenarios.
+  - Integrate Injury Data: To explore the link with sports medicine, future work could incorporate injury data to analyze how platoon strategies impact player health. For example, tracking injury rates for aggressive clusters (e.g., RHB-2, LHB-4) during consecutive road games could reveal whether strategic rotation reduces injury risk and improves load management. This could involve analyzing medical records, game logs, and player workload metrics to quantify the relationship between platoon usage, physical stress, and injury incidence.
+  - Regular-Season Focus: Excluding playoff data or adjusting for postseason effects could improve the generalizability of findings to regular-season strategies.
+
+By integrating these elements, future research can provide a more holistic understanding of platoon strategies, balancing performance optimization with player health and well-being.
+
+
+# Conclusion
+
+This study demonstrates the power of Statcast data in analyzing platoon strategies. By combining swing metrics (bat speed, swing length, attack angle), clustering, and performance analysis, we provide a framework for lineup optimization. Future work could incorporate pitcher-specific metrics, such as arm angle variations [@adler2024rainbow], to enhance simulation accuracy.
+
+# Ethics
+
+This study, part of the CSAS 2025 Data Challenge, follows ethical principles in data science and sports analytics, ensuring responsible use of Statcast data and its implications for players and teams.
+
+- **Data Privacy:** The Statcast dataset (`statcast_pitch_swing_data_20240402_20241030_with_arm_angle.csv`) lacks PII beyond player names. We focused on aggregated statistics (e.g., RHB, LHB clusters) to avoid identifying individuals, minimizing risks of stigmatization based on swing or platoon performance.
+  
+- **Fairness:** We used objective methods (PCA, k-means, Monte Carlo simulation) to cluster batters and assess performance, ensuring unbiased analysis. Including regular season and playoff data reduces bias across game contexts.
+
+- **Transparency:** Methods (preprocessing, clustering, simulation) are documented in the paper and code (`platoon_code.R`), meeting Data Challenge reproducibility requirements. Future work with additional data will maintain transparency.
+
+- **Responsible Use:** Findings (e.g., LHB vs RHP: OPS+ = 108; RHB vs LHP: OPS+ = 104) aim to optimize lineups, but over-reliance on platoon matchups may hinder player development. Teams should balance analytics with holistic management to support player growth.
+
+- **Future Work with Injury Data:** Proposed injury data integration raises ethical concerns:
+  - **Confidentiality:** Anonymize injury data to protect player privacy.
+  - **Consent:** Ensure players consent to using medical data, understanding its purpose.
+  - **Stigma:** Avoid labeling players (e.g., RHB-2, LHB-4) as "injury-prone" by reporting aggregate results.
+  - **Welfare:** Use data to reduce injury risk (e.g., rotating aggressive hitters during road games), aligning with sports medicine goals.
+
+- **Compliance:** We adhered to CSAS 2025 Data Challenge guidelines, using the provided dataset without modification and ensuring reproducibility via documented code.
+
+This study responsibly contributes to sports analytics, prioritizing player well-being alongside performance insights.
+
+# References
+<div id="refs"></div>
+
+\clearpage
+
+# Appendix
+## Data Summary
+
+The dataset contains 701,557 pitches from the 2024 MLB season, including regular season and playoffs. Table A1 provides descriptive statistics for key variables used in the analysis, generated using the summarytools package. Numerical variables like bat speed (mean = 71.1 mph, SD = 4.8) and swing length (mean = 7.0 ft, SD = 0.6) show the distribution of swing characteristics, while launch angle and launch speed indicate batted ball outcomes. Categorical variables like stand (55.3% R, 44.7% L) and p_throws (70.2% R, 29.8% L) reflect the platoon split, and pitch type highlights the prevalence of four-seam fastballs (FF: 31.8%).
+
+```{r summary, results='asis', message=FALSE}
+library(summarytools)
+
+st_options(
+  plain.ascii        = FALSE,          # allow LaTeX symbols
+  style              = "rmarkdown",    # LaTeX-friendly table theme
+  dfSummary.style    = "grid",
+  dfSummary.graph.magnif = .52,        # shrink little barplots
+  tmp.img.dir        = "tmp"       # where PNGs get written
+)
+# Generate Table A1: Descriptive statistics using summarytools
+selected_data <- data[, c("bat_speed", "swing_length", "launch_angle", "launch_speed", "stand", "p_throws", "pitch_type")]
+table_a1 <- dfSummary(selected_data)
+print(table_a1, method = "pander")       # 'pander' works for PDF
+```
+
+## Full Platoon Summary by Cluster, Pitch Type, and Pitcher Handedness
+```{r}
+table_a2 <- data.frame(
+  Cluster = c("LHB-1", "LHB-1", "LHB-1", "LHB-1", "LHB-2", "LHB-2", "LHB-2", "LHB-2",
+              "LHB-3", "LHB-3", "LHB-3", "LHB-3", "LHB-4", "LHB-4", "LHB-4", "LHB-4",
+              "RHB-1", "RHB-1", "RHB-1", "RHB-1", "RHB-2", "RHB-2", "RHB-2", "RHB-2",
+              "RHB-3", "RHB-3", "RHB-3", "RHB-3", "RHB-4", "RHB-4", "RHB-4", "RHB-4"),
+  Pitch_Type = c("FF", "FF", "SL", "SL", "FF", "FF", "SL", "SL", "FF", "FF", "SL", "SL",
+                 "FF", "FF", "SL", "SL", "FF", "FF", "SL", "SL", "FF", "FF", "SL", "SL",
+                 "FF", "FF", "SL", "SL", "FF", "FF", "SL", "SL"),
+  Pitcher = c("LHP", "RHP", "LHP", "RHP", "LHP", "RHP", "LHP", "RHP", "LHP", "RHP", "LHP", "RHP",
+              "LHP", "RHP", "LHP", "RHP", "LHP", "RHP", "LHP", "RHP", "LHP", "RHP", "LHP", "RHP",
+              "LHP", "RHP", "LHP", "RHP", "LHP", "RHP", "LHP", "RHP"),
+  "Bat Speed (mph)" = c(65.2, 66.0, 63.7, 66.7, 69.9, 69.1, 67.5, 69.9, 70.2, 70.6, 67.8, 70.9,
+                        72.3, 73.4, 70.5, 73.5, 71.2, 70.9, 69.2, 71.3, 72.8, 72.4, 70.7, 72.5,
+                        67.0, 67.0, 65.3, 67.1, 69.5, 69.4, 67.6, 69.5),
+  "Swing Length (ft)" = c(6.3, 6.3, 7.1, 7.2, 6.7, 6.7, 7.2, 7.3, 6.8, 6.9, 7.2, 7.4,
+                          6.8, 6.9, 7.2, 7.4, 6.9, 7.0, 7.2, 7.3, 7.3, 7.3, 7.6, 7.7,
+                          6.4, 6.4, 7.0, 7.1, 6.8, 6.8, 7.2, 7.3),
+  "Attack Angle (deg)" = c(10.7, 10.2, 10.8, 10.2, 10.5, 12.2, 10.5, 12.2, 18.6, 20.1, 18.6, 20.1,
+                           13.7, 13.8, 13.7, 13.8, 6.2, 6.5, 6.2, 6.5, 15.9, 15.9, 15.9, 15.9,
+                           7.6, 7.6, 7.6, 7.6, 14.8, 15.3, 14.8, 15.3)
+)
+
+kable(table_a2, format = "latex", booktabs = TRUE, align = "c", caption = "Full Platoon Summary by Cluster, Pitch Type, and Pitcher Handedness") %>%
+  kable_styling(latex_options = c("HOLD_position"))
+```
+
+## Additional Visualizations
+```{r png-row-figs, echo=FALSE, out.width='0.8\\linewidth', fig.align='center', fig.subcap = c("Pitch Type by Pitcher Handedness", "Swing Length by Pitch Count", "Bat Speed vs. Swing Length")}
+knitr::include_graphics(
+  c("pitch_hand_plot.png", "swing_length_count_plot.png", "swing_length_plot.png")
+)
+```
